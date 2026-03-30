@@ -1,4 +1,4 @@
-# streamcorea-rust-sdk
+# streamcore-rust-sdk
 
 Rust SDK for connecting to a [StreamCoreAI](https://github.com/streamcoreai/streamcore-server) server via WebRTC + WHIP.
 

@@ -31,6 +31,35 @@ pub struct TranscriptEntry {
     pub partial: bool,
 }
 
+/// Server-reported state of the voice agent pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentState {
+    Listening,
+    Thinking,
+    Speaking,
+}
+
+impl AgentState {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "listening" => Some(Self::Listening),
+            "thinking" => Some(Self::Thinking),
+            "speaking" => Some(Self::Speaking),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for AgentState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Listening => write!(f, "listening"),
+            Self::Thinking => write!(f, "thinking"),
+            Self::Speaking => write!(f, "speaking"),
+        }
+    }
+}
+
 /// A message received on the WebRTC data channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataChannelMessage {
@@ -42,6 +71,8 @@ pub struct DataChannelMessage {
     pub r#final: bool,
     #[serde(default)]
     pub message: String,
+    #[serde(default)]
+    pub state: String,
 }
 
 /// Configuration for a [`Client`](crate::Client).
@@ -50,6 +81,16 @@ pub struct Config {
     /// WHIP signaling endpoint URL.
     /// Defaults to `"http://localhost:8080/whip"`.
     pub whip_endpoint: String,
+
+    /// Optional JWT token for authenticating with the WHIP endpoint.
+    pub token: Option<String>,
+
+    /// Token endpoint URL. If set, the client will POST to this URL to fetch
+    /// a JWT before each WHIP connection. Overrides `token` when both are set.
+    pub token_url: Option<String>,
+
+    /// API key sent as Bearer header when fetching from `token_url`.
+    pub api_key: Option<String>,
 
     /// ICE server URLs for the WebRTC connection.
     /// Defaults to `["stun:stun.l.google.com:19302"]`.
@@ -60,6 +101,9 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             whip_endpoint: "http://localhost:8080/whip".into(),
+            token: None,
+            token_url: None,
+            api_key: None,
             ice_servers: vec!["stun:stun.l.google.com:19302".into()],
         }
     }
@@ -78,6 +122,9 @@ pub struct EventHandler {
     /// Called when an error occurs.
     pub on_error: Option<Box<dyn Fn(String) + Send + Sync>>,
 
+    /// Called when the server reports an agent state transition.
+    pub on_agent_state_change: Option<Box<dyn Fn(AgentState) + Send + Sync>>,
+
     /// Called for every raw data channel message.
     pub on_data_channel_message: Option<Box<dyn Fn(DataChannelMessage) + Send + Sync>>,
 }
@@ -88,6 +135,7 @@ impl Default for EventHandler {
             on_status_change: None,
             on_transcript: None,
             on_error: None,
+            on_agent_state_change: None,
             on_data_channel_message: None,
         }
     }

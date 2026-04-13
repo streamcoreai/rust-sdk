@@ -200,8 +200,15 @@ impl Client {
             webrtc::Error::new("local description not available after ICE gathering".to_string())
         })?;
 
+        // Fetch a fresh token from the token endpoint if configured.
+        let token = if let Some(url) = &self.config.token_url {
+            Some(whip::fetch_token(url, self.config.api_key.as_deref()).await?)
+        } else {
+            self.config.token.clone()
+        };
+
         // WHIP exchange.
-        let result = whip::whip_offer(&self.config.whip_endpoint, &local_desc.sdp).await?;
+        let result = whip::whip_offer(&self.config.whip_endpoint, &local_desc.sdp, token.as_deref()).await?;
         *self.session_url.lock().unwrap() = result.session_url;
 
         let answer = RTCSessionDescription::answer(result.answer_sdp)?;
@@ -218,7 +225,8 @@ impl Client {
             let mut url = self.session_url.lock().unwrap();
             std::mem::take(&mut *url)
         };
-        whip::whip_delete(&session_url).await;
+        let token = self.config.token.as_deref();
+        whip::whip_delete(&session_url, token).await;
 
         if let Some(pc) = self.pc.lock().unwrap().take() {
             let _ = pc.close().await;
@@ -322,6 +330,13 @@ fn handle_dc_message(
         "error" => {
             if let Some(ref cb) = events.on_error {
                 cb(msg.message.clone());
+            }
+        }
+        "state" => {
+            if let Some(ref cb) = events.on_agent_state_change {
+                if let Some(state) = AgentState::from_str(&msg.state) {
+                    cb(state);
+                }
             }
         }
         _ => {

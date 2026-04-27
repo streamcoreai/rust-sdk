@@ -40,6 +40,12 @@ pub struct Client {
     state: Arc<Mutex<ClientState>>,
     pc: Mutex<Option<Arc<RTCPeerConnection>>>,
     session_url: Mutex<String>,
+    /// Most recently used JWT (either the static `config.token` or one fetched
+    /// from `config.token_url` during `connect`). `disconnect` reuses this so
+    /// the WHIP DELETE is properly authenticated; otherwise servers enforcing
+    /// Bearer auth on `/whip` reject the teardown and skip server-side
+    /// finalization (billing, transcript persistence, etc.).
+    last_token: Mutex<Option<String>>,
 
     /// The outbound audio track. Write RTP packets here to send audio to the server.
     /// Available after [`connect`](Client::connect) returns.
@@ -86,6 +92,7 @@ impl Client {
             })),
             pc: Mutex::new(None),
             session_url: Mutex::new(String::new()),
+            last_token: Mutex::new(None),
             local_track,
             remote_track_notify: Arc::new(Notify::new()),
             remote_track: Arc::new(Mutex::new(None)),
@@ -207,8 +214,16 @@ impl Client {
             self.config.token.clone()
         };
 
+        // Cache the token so `disconnect` can authenticate the WHIP DELETE.
+        *self.last_token.lock().unwrap() = token.clone();
+
         // WHIP exchange.
-        let result = whip::whip_offer(&self.config.whip_endpoint, &local_desc.sdp, token.as_deref()).await?;
+        let result = whip::whip_offer(
+            &self.config.whip_endpoint,
+            &local_desc.sdp,
+            token.as_deref(),
+        )
+        .await?;
         *self.session_url.lock().unwrap() = result.session_url;
 
         let answer = RTCSessionDescription::answer(result.answer_sdp)?;
@@ -225,8 +240,23 @@ impl Client {
             let mut url = self.session_url.lock().unwrap();
             std::mem::take(&mut *url)
         };
-        let token = self.config.token.as_deref();
-        whip::whip_delete(&session_url, token).await;
+
+        // Resolve the token used for the WHIP DELETE. Prefer the cached token
+        // captured during `connect` (which may have come from `token_url`),
+        // fall back to the static `config.token`, and as a last resort
+        // re-fetch from `token_url` so teardown still authenticates.
+        let mut token = self.last_token.lock().unwrap().take();
+        if token.is_none() {
+            token = self.config.token.clone();
+        }
+        if token.is_none() {
+            if let Some(url) = &self.config.token_url {
+                if let Ok(t) = whip::fetch_token(url, self.config.api_key.as_deref()).await {
+                    token = Some(t);
+                }
+            }
+        }
+        whip::whip_delete(&session_url, token.as_deref()).await;
 
         if let Some(pc) = self.pc.lock().unwrap().take() {
             let _ = pc.close().await;

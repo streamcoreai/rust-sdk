@@ -6,6 +6,10 @@ pub enum ConnectionStatus {
     Idle,
     Connecting,
     Connected,
+    /// The transport dropped and an ICE restart is in flight. The session, and
+    /// with it the conversation, is still alive on the server — this is not a
+    /// terminal state and usually resolves back to `Connected`.
+    Reconnecting,
     Error,
     Disconnected,
 }
@@ -16,10 +20,31 @@ impl std::fmt::Display for ConnectionStatus {
             Self::Idle => write!(f, "idle"),
             Self::Connecting => write!(f, "connecting"),
             Self::Connected => write!(f, "connected"),
+            Self::Reconnecting => write!(f, "reconnecting"),
             Self::Error => write!(f, "error"),
             Self::Disconnected => write!(f, "disconnected"),
         }
     }
+}
+
+/// Where an ICE restart attempt got to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconnectOutcome {
+    Attempting,
+    Recovered,
+    Failed,
+}
+
+/// Progress of the ICE restart sequence.
+#[derive(Debug, Clone)]
+pub struct ReconnectEvent {
+    /// 1-based attempt number.
+    pub attempt: u32,
+    /// Total attempts before giving up.
+    pub max_attempts: u32,
+    pub outcome: ReconnectOutcome,
+    /// Why the attempt failed, when `outcome` is `Failed`.
+    pub error: Option<String>,
 }
 
 /// A single transcript message in the conversation.
@@ -106,6 +131,21 @@ pub struct Config {
     /// ICE server URLs for the WebRTC connection.
     /// Defaults to `["stun:stun.l.google.com:19302"]`.
     pub ice_servers: Vec<String>,
+
+    /// How many ICE restarts to attempt before giving up on a dropped
+    /// connection. Attempts are spaced by `reconnect_delay` doubling each
+    /// time, and the whole sequence must finish inside the ~25 seconds it
+    /// takes the connection to go from disconnected to failed — past that the
+    /// server has closed the peer and only a fresh `connect` recovers.
+    /// Defaults to 3. Zero disables automatic reconnection.
+    pub reconnect_attempts: u32,
+
+    /// Wait before the first ICE restart attempt, doubling for each retry.
+    /// The initial wait matters: most disconnected transitions are brief
+    /// packet loss that ICE repairs on its own, and patching immediately would
+    /// spend a restart on a connection that was about to recover by itself.
+    /// Defaults to 2s.
+    pub reconnect_delay: std::time::Duration,
 }
 
 impl Default for Config {
@@ -116,6 +156,8 @@ impl Default for Config {
             token_url: None,
             api_key: None,
             ice_servers: vec!["stun:stun.l.google.com:19302".into()],
+            reconnect_attempts: 3,
+            reconnect_delay: std::time::Duration::from_secs(2),
         }
     }
 }
@@ -141,6 +183,10 @@ pub struct EventHandler {
 
     /// Called for every raw data channel message.
     pub on_data_channel_message: Option<Box<dyn Fn(DataChannelMessage) + Send + Sync>>,
+
+    /// Called for each ICE restart attempt and once when the outcome is known,
+    /// so a UI can distinguish a recoverable drop from a lost call.
+    pub on_reconnect: Option<Box<dyn Fn(ReconnectEvent) + Send + Sync>>,
 }
 
 impl Default for EventHandler {
@@ -152,6 +198,7 @@ impl Default for EventHandler {
             on_timing: None,
             on_agent_state_change: None,
             on_data_channel_message: None,
+            on_reconnect: None,
         }
     }
 }

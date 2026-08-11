@@ -1,7 +1,9 @@
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use tokio::sync::Notify;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_OPUS};
 use webrtc::api::APIBuilder;
@@ -19,6 +21,7 @@ use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_remote::TrackRemote;
 
 use crate::audio::AudioState;
+use crate::icerestart::{apply_ice_fragment, ice_fragment_from_sdp};
 use crate::types::*;
 use crate::whip;
 
@@ -39,13 +42,18 @@ pub struct Client {
     events: Arc<EventHandler>,
     state: Arc<Mutex<ClientState>>,
     pc: Mutex<Option<Arc<RTCPeerConnection>>>,
-    session_url: Mutex<String>,
+    session_url: Arc<Mutex<String>>,
     /// Most recently used JWT (either the static `config.token` or one fetched
     /// from `config.token_url` during `connect`). `disconnect` reuses this so
     /// the WHIP DELETE is properly authenticated; otherwise servers enforcing
     /// Bearer auth on `/whip` reject the teardown and skip server-side
     /// finalization (billing, transcript persistence, etc.).
-    last_token: Mutex<Option<String>>,
+    last_token: Arc<Mutex<Option<String>>>,
+    /// ETag of the current ICE session, sent as `If-Match` on a restart.
+    etag: Arc<Mutex<String>>,
+    /// Set by `disconnect` so an in-flight restart abandons itself rather than
+    /// PATCHing a session that is about to be deleted.
+    cancelled: Arc<AtomicBool>,
 
     /// The outbound audio track. Write RTP packets here to send audio to the server.
     /// Available after [`connect`](Client::connect) returns.
@@ -66,6 +74,196 @@ struct ClientState {
     status: ConnectionStatus,
     transcript: Vec<TranscriptEntry>,
     assist_buf: String,
+}
+
+/// Everything the ICE restart sequence needs, in a form the peer connection's
+/// state callback can own.
+///
+/// The peer connection is held weakly on purpose: the callback is registered
+/// *on* that connection, so a strong reference here would keep it alive
+/// forever.
+#[derive(Clone)]
+struct ReconnectCtx {
+    pc: Weak<RTCPeerConnection>,
+    session_url: Arc<Mutex<String>>,
+    etag: Arc<Mutex<String>>,
+    token: Arc<Mutex<Option<String>>>,
+    fallback_token: Option<String>,
+    events: Arc<EventHandler>,
+    state: Arc<Mutex<ClientState>>,
+    cancelled: Arc<AtomicBool>,
+    reconnecting: Arc<AtomicBool>,
+    max_attempts: u32,
+    delay: Duration,
+}
+
+impl ReconnectCtx {
+    fn set_status(&self, status: ConnectionStatus) {
+        self.state.lock().unwrap().status = status;
+        if let Some(ref cb) = self.events.on_status_change {
+            cb(status);
+        }
+    }
+
+    fn emit(&self, attempt: u32, outcome: ReconnectOutcome, error: Option<String>) {
+        if let Some(ref cb) = self.events.on_reconnect {
+            cb(ReconnectEvent {
+                attempt,
+                max_attempts: self.max_attempts,
+                outcome,
+                error,
+            });
+        }
+    }
+
+    fn token(&self) -> Option<String> {
+        self.token
+            .lock()
+            .unwrap()
+            .clone()
+            .or_else(|| self.fallback_token.clone())
+    }
+}
+
+/// Recover a dropped transport with an ICE restart, keeping the session — and
+/// therefore the conversation — alive on the server.
+///
+/// Each attempt re-gathers candidates, PATCHes the resulting fragment to the
+/// session URL, and folds the server's reply back into the remote description.
+/// Between attempts it re-checks the connection state, because plain ICE
+/// frequently repairs the drop unaided and a restart would then be wasted work.
+async fn run_reconnect(ctx: ReconnectCtx) {
+    if ctx.max_attempts == 0 {
+        ctx.set_status(ConnectionStatus::Disconnected);
+        return;
+    }
+    // Only one sequence at a time.
+    if ctx
+        .reconnecting
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+
+    ctx.set_status(ConnectionStatus::Reconnecting);
+    let mut delay = ctx.delay;
+
+    for attempt in 1..=ctx.max_attempts {
+        tokio::time::sleep(delay).await;
+        delay *= 2;
+
+        if ctx.cancelled.load(Ordering::SeqCst) {
+            break;
+        }
+        let Some(pc) = ctx.pc.upgrade() else { break };
+
+        match pc.connection_state() {
+            RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed => break,
+            RTCPeerConnectionState::Connected => {
+                // Healed on its own while we waited.
+                ctx.set_status(ConnectionStatus::Connected);
+                ctx.emit(attempt, ReconnectOutcome::Recovered, None);
+                break;
+            }
+            _ => {}
+        }
+
+        ctx.emit(attempt, ReconnectOutcome::Attempting, None);
+
+        match restart_ice(&ctx, &pc).await {
+            Ok(()) => {
+                // The restart is applied; ICE still has to complete its
+                // checks, so the move back to Connected comes from the state
+                // callback.
+                ctx.emit(attempt, ReconnectOutcome::Recovered, None);
+                break;
+            }
+            Err(err) => {
+                let terminal = !err.restart_retryable();
+                if terminal || attempt == ctx.max_attempts {
+                    ctx.set_status(ConnectionStatus::Disconnected);
+                    ctx.emit(attempt, ReconnectOutcome::Failed, Some(err.to_string()));
+                    break;
+                }
+                // A 412 means another restart landed first; adopt the ETag the
+                // server reported as current and try again against it.
+                if let whip::WhipError::RestartRejected {
+                    ref current_etag, ..
+                } = err
+                {
+                    if !current_etag.is_empty() {
+                        *ctx.etag.lock().unwrap() = current_etag.clone();
+                    }
+                }
+                warn!("ICE restart attempt {} failed: {}", attempt, err);
+            }
+        }
+    }
+
+    ctx.reconnecting.store(false, Ordering::SeqCst);
+}
+
+/// One ICE restart round-trip against the existing peer connection.
+async fn restart_ice(
+    ctx: &ReconnectCtx,
+    pc: &Arc<RTCPeerConnection>,
+) -> Result<(), whip::WhipError> {
+    let remote = pc.remote_description().await.ok_or_else(|| {
+        whip::WhipError::TokenFetch("no remote description to restart against".into())
+    })?;
+
+    let offer = pc
+        .create_offer(Some(webrtc::peer_connection::offer_answer_options::RTCOfferOptions {
+            ice_restart: true,
+            voice_activity_detection: false,
+        }))
+        .await
+        .map_err(|e| whip::WhipError::TokenFetch(format!("create restart offer: {e}")))?;
+
+    // The promise must be taken after create_offer, which is what reopens
+    // gathering — one taken earlier would resolve against the old generation.
+    let mut gather_done = pc.gathering_complete_promise().await;
+    pc.set_local_description(offer)
+        .await
+        .map_err(|e| whip::WhipError::TokenFetch(format!("set restart offer: {e}")))?;
+
+    if tokio::time::timeout(Duration::from_secs(5), gather_done.recv())
+        .await
+        .is_err()
+    {
+        warn!("ICE re-gathering timed out, patching partial candidates");
+    }
+
+    let local = pc.local_description().await.ok_or_else(|| {
+        whip::WhipError::TokenFetch("no local description after restart offer".into())
+    })?;
+
+    let session_url = ctx.session_url.lock().unwrap().clone();
+    let etag = ctx.etag.lock().unwrap().clone();
+
+    let result = whip::whip_restart_ice(
+        &session_url,
+        &ice_fragment_from_sdp(&local.sdp),
+        Some(&etag),
+        ctx.token().as_deref(),
+    )
+    .await?;
+
+    let answer_sdp = apply_ice_fragment(&remote.sdp, &result.fragment).ok_or_else(|| {
+        whip::WhipError::TokenFetch("ICE restart reply has no ICE credentials".into())
+    })?;
+
+    // The offer left us in have-local-offer; the connection only returns to
+    // stable once this answer is applied.
+    let answer = RTCSessionDescription::answer(answer_sdp)
+        .map_err(|e| whip::WhipError::TokenFetch(format!("parse restart answer: {e}")))?;
+    pc.set_remote_description(answer)
+        .await
+        .map_err(|e| whip::WhipError::TokenFetch(format!("set restart answer: {e}")))?;
+
+    *ctx.etag.lock().unwrap() = result.etag;
+    Ok(())
 }
 
 impl Client {
@@ -91,8 +289,10 @@ impl Client {
                 assist_buf: String::new(),
             })),
             pc: Mutex::new(None),
-            session_url: Mutex::new(String::new()),
-            last_token: Mutex::new(None),
+            session_url: Arc::new(Mutex::new(String::new())),
+            last_token: Arc::new(Mutex::new(None)),
+            etag: Arc::new(Mutex::new(String::new())),
+            cancelled: Arc::new(AtomicBool::new(false)),
             local_track,
             remote_track_notify: Arc::new(Notify::new()),
             remote_track: Arc::new(Mutex::new(None)),
@@ -164,24 +364,41 @@ impl Client {
         }));
 
         // Handle connection state changes.
-        let events = Arc::clone(&self.events);
-        let state = Arc::clone(&self.state);
+        self.cancelled.store(false, Ordering::SeqCst);
+        let ctx = ReconnectCtx {
+            pc: Arc::downgrade(&pc),
+            session_url: Arc::clone(&self.session_url),
+            etag: Arc::clone(&self.etag),
+            token: Arc::clone(&self.last_token),
+            fallback_token: self.config.token.clone(),
+            events: Arc::clone(&self.events),
+            state: Arc::clone(&self.state),
+            cancelled: Arc::clone(&self.cancelled),
+            reconnecting: Arc::new(AtomicBool::new(false)),
+            max_attempts: self.config.reconnect_attempts,
+            delay: self.config.reconnect_delay,
+        };
         pc.on_peer_connection_state_change(Box::new(move |s| {
-            let events = Arc::clone(&events);
-            let state = Arc::clone(&state);
+            let ctx = ctx.clone();
             Box::pin(async move {
                 let new_status = match s {
                     RTCPeerConnectionState::Connected => ConnectionStatus::Connected,
                     RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
                         ConnectionStatus::Disconnected
                     }
-                    RTCPeerConnectionState::Disconnected => ConnectionStatus::Disconnected,
+                    RTCPeerConnectionState::Disconnected => {
+                        // Transient. ICE often repairs this unaided, so the
+                        // restart sequence waits before spending an attempt —
+                        // but if the local address changed it never will, and
+                        // this is the only window in which a restart can still
+                        // work: at ~25s the server sees Failed, closes the
+                        // peer, and the session becomes unrecoverable.
+                        tokio::spawn(run_reconnect(ctx));
+                        return;
+                    }
                     _ => return,
                 };
-                state.lock().unwrap().status = new_status;
-                if let Some(ref cb) = events.on_status_change {
-                    cb(new_status);
-                }
+                ctx.set_status(new_status);
             })
         }));
 
@@ -225,6 +442,7 @@ impl Client {
         )
         .await?;
         *self.session_url.lock().unwrap() = result.session_url;
+        *self.etag.lock().unwrap() = result.etag;
 
         let answer = RTCSessionDescription::answer(result.answer_sdp)?;
         pc.set_remote_description(answer).await?;
@@ -236,6 +454,11 @@ impl Client {
 
     /// Tear down the WebRTC connection and free resources.
     pub async fn disconnect(&self) {
+        // Abandons any in-flight ICE restart: it would otherwise PATCH a
+        // session this call is about to DELETE.
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.etag.lock().unwrap().clear();
+
         let session_url = {
             let mut url = self.session_url.lock().unwrap();
             std::mem::take(&mut *url)

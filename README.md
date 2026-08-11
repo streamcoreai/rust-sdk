@@ -85,6 +85,11 @@ async fn main() -> anyhow::Result<()> {
 
 Creates a new client instance.
 
+> **Note (0.1.7):** `connect` now takes `&Arc<Self>` so automatic recovery can
+> rebuild the transport after a failure. Code that already holds an
+> `Arc<Client>` — as both examples do — is unchanged; code holding a bare
+> `Client` needs to wrap it in an `Arc` first.
+
 #### `Config`
 
 | Field           | Type              | Default                              | Description                 |
@@ -94,8 +99,10 @@ Creates a new client instance.
 | `token_url`     | `Option<String>`  | `None`                               | Token endpoint; when set, a JWT is fetched before each connection (overrides `token`) |
 | `api_key`       | `Option<String>`  | `None`                               | Sent as `Authorization: Bearer` when fetching from `token_url` |
 | `ice_servers`   | `Vec<String>`     | `["stun:stun.l.google.com:19302"]` | ICE server URLs             |
-| `reconnect_attempts` | `u32`        | `3`                                  | ICE restarts to attempt after a drop; `0` disables automatic reconnection |
-| `reconnect_delay` | `Duration`      | `2s`                                 | Wait before the first restart attempt, doubling each retry |
+| `reconnect_attempts` | `u32`        | `3`                                  | ICE restarts while `Disconnected`; `0` disables the phase |
+| `reconnect_delay` | `Duration`      | `2s`                                 | Wait before the first ICE restart, doubling each retry |
+| `resume_attempts` | `u32`           | `2`                                  | Resume redials once the connection has `Failed`; `0` disables the phase |
+| `resume_delay`  | `Duration`        | `1s`                                 | Wait before the first redial, doubling each retry |
 
 `Config` implements `Default`, so `..Default::default()` fills in everything you leave out.
 
@@ -160,45 +167,76 @@ pub struct DataChannelMessage {
 
 ## Reconnection
 
-A network change mid-call — a machine moving networks, a VPN toggle, a NAT
-rebind that does not recover — kills the transport without ending the call. The
-client recovers it with an ICE restart, which keeps the *same* server session:
-the conversation history, the rolling summary, and the agent's state all
-survive, and there is no repeated greeting. This is automatic.
+A network change mid-call — a machine moving networks, a VPN toggle, a process
+suspended and resumed — kills the transport without ending the call. The client
+recovers it automatically and the conversation survives: the agent still knows
+who it is talking to and does not replay its greeting.
 
-Status goes `Connected` -> `Reconnecting` -> `Connected`. Set `on_reconnect`
-for per-attempt detail:
+Recovery runs as a **ladder of two phases**:
+
+| Phase | When | Cost |
+|-------|------|------|
+| **ICE restart** | While the connection is `Disconnected` | Invisible. Same peer connection, same DTLS, same tracks — just new candidates. |
+| **Resume redial** | Once the connection has `Failed` | A full renegotiation and a moment of silence, but the server reattaches you to the same conversation. |
+
+ICE restart is tried first because it costs nothing. It stops being possible
+the moment the connection reaches `Failed` — the server has closed its peer by
+then — which is where a process that was paused, or offline for more than about
+25 seconds, always lands. The resume phase recovers those.
+
+Status goes `Connected` → `Reconnecting` → `Connected`:
 
 ```rust
 let config = Config {
-    reconnect_attempts: 3,
+    reconnect_attempts: 3,                       // ICE restarts, 2s -> 4s -> 8s
     reconnect_delay: Duration::from_secs(2),
+    resume_attempts: 2,                          // then redials,  1s -> 2s
+    resume_delay: Duration::from_secs(1),
     ..Default::default()
 };
 let events = EventHandler {
     on_reconnect: Some(Box::new(|e| {
-        println!("ICE restart {}/{}: {:?}", e.attempt, e.max_attempts, e.outcome);
+        println!("{:?} {}/{}: {:?}", e.phase, e.attempt, e.max_attempts, e.outcome);
+        if e.outcome == ReconnectOutcome::RecoveredWithoutHistory {
+            println!("reconnected, but the agent has lost the conversation");
+        }
     })),
     ..Default::default()
 };
+
+// `connect` takes `&Arc<Self>` so recovery can rebuild the transport.
+let client = Arc::new(Client::new(config, events));
+client.connect().await?;
 ```
+
+**Handle `ReconnectOutcome::RecoveredWithoutHistory`.** It means the call is
+working but the server could not resume the session — usually because the
+client was away longer than `session_grace_ms` — so the agent has no memory of
+anything said before. Everything still functions, which is exactly why it goes
+unnoticed until the agent asks something it was already told.
 
 Two details worth knowing:
 
-- **The first attempt is deliberately delayed** (`reconnect_delay`, default
+- **The first ICE restart is deliberately delayed** (`reconnect_delay`, default
   2s). Most drops are brief packet loss that ICE repairs unaided, and patching
-  immediately would spend a restart on a connection that was about to recover
+  immediately would spend an attempt on a connection that was about to recover
   by itself.
-- **The whole sequence must finish within ~25 seconds.** That is how long
-  webrtc-rs takes to escalate from `Disconnected` to `Failed`, at which point
-  the server closes the peer and the session is gone for good. The defaults (3
-  attempts at 2s, 4s, 8s) fit inside that window — if you raise
-  `reconnect_attempts`, keep the total under it, or the last attempts are
-  wasted.
+- **Both phases share one deadline.** `Disconnected` becomes `Failed` after
+  roughly 25 seconds, and the server then holds the conversation for
+  `session_grace_ms` (30s by default). Raising `reconnect_attempts` spends
+  budget the resume phase would otherwise have.
 
-If every attempt fails, or the server reports the session is gone (404/409),
-the status becomes `Disconnected`; call `connect` again for a fresh session.
+Set `reconnect_attempts` or `resume_attempts` to `0` to disable either phase.
 
+**What this means for your audio loops.** `local_track` is deliberately *not*
+replaced across a redial — the same track is rebound to the new peer
+connection, so a task writing RTP to it keeps working. Inbound audio is
+different: the server sends a new track. `recv_pcm` handles that for you (it
+picks up the replacement and keeps decoding, so a reconnect is a gap in the
+audio rather than an error). If you read `remote_track` yourself, re-read it
+after a reconnect — the old track only returns read errors.
+
+## Audio I/O
 ## Audio I/O
 
 The SDK handles Opus encoding/decoding and RTP packetization internally. You only work with raw PCM `f32` samples:

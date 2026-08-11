@@ -311,7 +311,8 @@ mod tests {
 
     #[test]
     fn rejects_a_fragment_without_credentials() {
-        let trickle = "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=candidate:1 1 udp 1 1.2.3.4 1 typ host\r\n";
+        let trickle =
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=candidate:1 1 udp 1 1.2.3.4 1 typ host\r\n";
         assert!(apply_ice_fragment(REMOTE_ANSWER, trickle).is_none());
     }
 

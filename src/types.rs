@@ -27,21 +27,38 @@ impl std::fmt::Display for ConnectionStatus {
     }
 }
 
-/// Where an ICE restart attempt got to.
+/// Which recovery mechanism an attempt used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconnectPhase {
+    /// Keeps the existing transport alive. Only possible while the connection
+    /// is `Disconnected`; nothing above the transport notices.
+    IceRestart,
+    /// Rebuilds the transport and reattaches it to the same server-side
+    /// conversation. The only option once the connection has `Failed`.
+    Resume,
+}
+
+/// Where a recovery attempt got to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconnectOutcome {
     Attempting,
     Recovered,
+    /// The call works but the server could not resume the session, so the
+    /// agent has forgotten the conversation and will not know what was already
+    /// said. Worth surfacing to the user rather than only logging.
+    RecoveredWithoutHistory,
     Failed,
 }
 
-/// Progress of the ICE restart sequence.
+/// Progress of the recovery sequence.
 #[derive(Debug, Clone)]
 pub struct ReconnectEvent {
-    /// 1-based attempt number.
+    /// 1-based attempt number, counted within the phase.
     pub attempt: u32,
-    /// Total attempts before giving up.
+    /// Attempts this phase makes before moving on or giving up.
     pub max_attempts: u32,
+    /// Which mechanism this attempt used.
+    pub phase: ReconnectPhase,
     pub outcome: ReconnectOutcome,
     /// Why the attempt failed, when `outcome` is `Failed`.
     pub error: Option<String>,
@@ -146,6 +163,23 @@ pub struct Config {
     /// spend a restart on a connection that was about to recover by itself.
     /// Defaults to 2s.
     pub reconnect_delay: std::time::Duration,
+
+    /// How many times to redial with the session's resume token after ICE
+    /// restart is no longer possible — which is the case as soon as the
+    /// connection reaches `Failed`, and the only case for a process that was
+    /// suspended or offline longer than ICE tolerates.
+    ///
+    /// A redial builds a new transport but reattaches to the same
+    /// conversation, so history and the agent's memory survive. The deadline
+    /// is the server's `session_grace_ms` (30s by default) measured from the
+    /// drop, and the ICE restart phase spends from the same budget.
+    /// Defaults to 2. Zero disables the resume phase.
+    pub resume_attempts: u32,
+
+    /// Wait before the first resume redial, doubling for each retry. Shorter
+    /// than `reconnect_delay` because by this point the connection is known
+    /// dead — there is nothing left to wait out. Defaults to 1s.
+    pub resume_delay: std::time::Duration,
 }
 
 impl Default for Config {
@@ -158,6 +192,8 @@ impl Default for Config {
             ice_servers: vec!["stun:stun.l.google.com:19302".into()],
             reconnect_attempts: 3,
             reconnect_delay: std::time::Duration::from_secs(2),
+            resume_attempts: 2,
+            resume_delay: std::time::Duration::from_secs(1),
         }
     }
 }

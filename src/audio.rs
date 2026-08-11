@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use audiopus::coder::{Decoder as OpusDecoder, Encoder as OpusEncoder};
 use audiopus::{Application, Channels, SampleRate};
@@ -96,7 +96,7 @@ impl Client {
             guard.clone()
         };
 
-        let track = match track {
+        let mut track = match track {
             Some(t) => t,
             None => {
                 self.remote_track_notify.notified().await;
@@ -111,10 +111,24 @@ impl Client {
         let mut buf = vec![0u8; 1500];
 
         loop {
-            let (rtp_pkt, _) = track
-                .read(&mut buf)
-                .await
-                .map_err(|e| ClientError::Audio(format!("track read: {e}")))?;
+            let read = track.read(&mut buf).await;
+            let (rtp_pkt, _) = match read {
+                Ok(v) => v,
+                Err(e) => {
+                    // The track died with the connection that carried it. If
+                    // recovery has already delivered a replacement, keep
+                    // going: to the caller a reconnect should be a gap in the
+                    // audio, not the end of the stream.
+                    let current = self.remote_track.lock().unwrap().clone();
+                    match current {
+                        Some(t) if !Arc::ptr_eq(&t, &track) => {
+                            track = t;
+                            continue;
+                        }
+                        _ => return Err(ClientError::Audio(format!("track read: {e}"))),
+                    }
+                }
+            };
 
             if rtp_pkt.payload.is_empty() {
                 continue;

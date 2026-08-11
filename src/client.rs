@@ -1,4 +1,6 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -54,6 +56,16 @@ pub struct Client {
     /// Set by `disconnect` so an in-flight restart abandons itself rather than
     /// PATCHing a session that is about to be deleted.
     cancelled: Arc<AtomicBool>,
+    /// Single-use credential that reattaches a redial to this conversation.
+    /// Re-issued by the server on every response.
+    resume_token: Arc<Mutex<String>>,
+    /// The server's answer on the last POST: "new", "resumed", or "expired".
+    resume_status: Arc<Mutex<String>>,
+    /// Guards the recovery sequence so it is never doubled up.
+    reconnecting: Arc<AtomicBool>,
+    /// Bumped by `connect` and `disconnect` so an in-flight recovery abandons
+    /// itself rather than fighting the connection replacing it.
+    generation: Arc<AtomicU64>,
 
     /// The outbound audio track. Write RTP packets here to send audio to the server.
     /// Available after [`connect`](Client::connect) returns.
@@ -85,16 +97,25 @@ struct ClientState {
 #[derive(Clone)]
 struct ReconnectCtx {
     pc: Weak<RTCPeerConnection>,
+    /// Held weakly so the callback registered on the peer connection does not
+    /// keep the whole client alive. Phase two needs it to rebuild the
+    /// transport from scratch.
+    client: Weak<Client>,
     session_url: Arc<Mutex<String>>,
     etag: Arc<Mutex<String>>,
+    resume_token: Arc<Mutex<String>>,
+    resume_status: Arc<Mutex<String>>,
     token: Arc<Mutex<Option<String>>>,
     fallback_token: Option<String>,
     events: Arc<EventHandler>,
     state: Arc<Mutex<ClientState>>,
     cancelled: Arc<AtomicBool>,
     reconnecting: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
     max_attempts: u32,
     delay: Duration,
+    resume_attempts: u32,
+    resume_delay: Duration,
 }
 
 impl ReconnectCtx {
@@ -105,11 +126,19 @@ impl ReconnectCtx {
         }
     }
 
-    fn emit(&self, attempt: u32, outcome: ReconnectOutcome, error: Option<String>) {
+    fn emit(
+        &self,
+        attempt: u32,
+        max_attempts: u32,
+        phase: ReconnectPhase,
+        outcome: ReconnectOutcome,
+        error: Option<String>,
+    ) {
         if let Some(ref cb) = self.events.on_reconnect {
             cb(ReconnectEvent {
                 attempt,
-                max_attempts: self.max_attempts,
+                max_attempts,
+                phase,
                 outcome,
                 error,
             });
@@ -125,18 +154,23 @@ impl ReconnectCtx {
     }
 }
 
-/// Recover a dropped transport with an ICE restart, keeping the session — and
-/// therefore the conversation — alive on the server.
+/// Recover a dropped connection, in two phases.
 ///
-/// Each attempt re-gathers candidates, PATCHes the resulting fragment to the
-/// session URL, and folds the server's reply back into the remote description.
-/// Between attempts it re-checks the connection state, because plain ICE
-/// frequently repairs the drop unaided and a restart would then be wasted work.
+/// **ICE restart** first, while the peer connection is merely `Disconnected`.
+/// It keeps the transport itself alive — same `RTCPeerConnection`, same DTLS,
+/// same tracks — so nothing above it notices.
+///
+/// **Resume redial** when that is no longer possible: once the connection has
+/// `Failed` the server has closed its peer and there is nothing left to
+/// restart. A fresh peer connection then POSTs with the session's resume
+/// token, and the server reattaches it to the same conversation. The transport
+/// is new; the history, the rolling summary and the agent's memory of the call
+/// are not.
+///
+/// The phases share a deadline: the server holds an abandoned conversation for
+/// `session_grace_ms` (30s by default), and time spent on restarts is time not
+/// available for redials.
 async fn run_reconnect(ctx: ReconnectCtx) {
-    if ctx.max_attempts == 0 {
-        ctx.set_status(ConnectionStatus::Disconnected);
-        return;
-    }
     // Only one sequence at a time.
     if ctx
         .reconnecting
@@ -147,44 +181,87 @@ async fn run_reconnect(ctx: ReconnectCtx) {
     }
 
     ctx.set_status(ConnectionStatus::Reconnecting);
+    let generation = ctx.generation.load(Ordering::SeqCst);
+
+    if !recover_by_ice_restart(&ctx, generation).await
+        && generation == ctx.generation.load(Ordering::SeqCst)
+    {
+        recover_by_resume(&ctx, generation).await;
+    }
+
+    ctx.reconnecting.store(false, Ordering::SeqCst);
+}
+
+/// Phase one: keep the transport alive with an ICE restart.
+///
+/// Returns true when the drop is dealt with — recovered, or abandoned because
+/// the client itself went away. False means phase two should take over.
+async fn recover_by_ice_restart(ctx: &ReconnectCtx, generation: u64) -> bool {
+    if ctx.max_attempts == 0 {
+        return false;
+    }
     let mut delay = ctx.delay;
 
     for attempt in 1..=ctx.max_attempts {
         tokio::time::sleep(delay).await;
         delay *= 2;
 
-        if ctx.cancelled.load(Ordering::SeqCst) {
-            break;
+        if ctx.cancelled.load(Ordering::SeqCst)
+            || generation != ctx.generation.load(Ordering::SeqCst)
+        {
+            return true;
         }
-        let Some(pc) = ctx.pc.upgrade() else { break };
+        let Some(pc) = ctx.pc.upgrade() else {
+            return false;
+        };
 
         match pc.connection_state() {
-            RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed => break,
+            RTCPeerConnectionState::Closed => return true,
+            // The server has already closed its peer; every further restart
+            // would 404.
+            RTCPeerConnectionState::Failed => return false,
             RTCPeerConnectionState::Connected => {
                 // Healed on its own while we waited.
                 ctx.set_status(ConnectionStatus::Connected);
-                ctx.emit(attempt, ReconnectOutcome::Recovered, None);
-                break;
+                ctx.emit(
+                    attempt,
+                    ctx.max_attempts,
+                    ReconnectPhase::IceRestart,
+                    ReconnectOutcome::Recovered,
+                    None,
+                );
+                return true;
             }
             _ => {}
         }
 
-        ctx.emit(attempt, ReconnectOutcome::Attempting, None);
+        ctx.emit(
+            attempt,
+            ctx.max_attempts,
+            ReconnectPhase::IceRestart,
+            ReconnectOutcome::Attempting,
+            None,
+        );
 
-        match restart_ice(&ctx, &pc).await {
+        match restart_ice(ctx, &pc).await {
             Ok(()) => {
                 // The restart is applied; ICE still has to complete its
                 // checks, so the move back to Connected comes from the state
                 // callback.
-                ctx.emit(attempt, ReconnectOutcome::Recovered, None);
-                break;
+                ctx.emit(
+                    attempt,
+                    ctx.max_attempts,
+                    ReconnectPhase::IceRestart,
+                    ReconnectOutcome::Recovered,
+                    None,
+                );
+                return true;
             }
             Err(err) => {
-                let terminal = !err.restart_retryable();
-                if terminal || attempt == ctx.max_attempts {
-                    ctx.set_status(ConnectionStatus::Disconnected);
-                    ctx.emit(attempt, ReconnectOutcome::Failed, Some(err.to_string()));
-                    break;
+                // 404/409/405 mean the session cannot be restarted at all —
+                // stop burning the shared deadline and let resume try.
+                if !err.restart_retryable() {
+                    return false;
                 }
                 // A 412 means another restart landed first; adopt the ETag the
                 // server reported as current and try again against it.
@@ -200,8 +277,86 @@ async fn run_reconnect(ctx: ReconnectCtx) {
             }
         }
     }
+    false
+}
 
-    ctx.reconnecting.store(false, Ordering::SeqCst);
+/// Phase two: rebuild the transport and reattach it to the conversation.
+///
+/// This is the only recovery available once the connection has failed, and the
+/// only one at all for a process that was suspended or offline for longer than
+/// ICE tolerates.
+async fn recover_by_resume(ctx: &ReconnectCtx, generation: u64) {
+    let token = ctx.resume_token.lock().unwrap().clone();
+    if ctx.resume_attempts == 0 || token.is_empty() {
+        ctx.set_status(ConnectionStatus::Disconnected);
+        return;
+    }
+
+    let mut delay = ctx.resume_delay;
+    for attempt in 1..=ctx.resume_attempts {
+        // The dead peer connection still holds a binding on the outbound
+        // track; drop it before building its replacement.
+        if let Some(client) = ctx.client.upgrade() {
+            client.close_peer_connection().await;
+        }
+
+        tokio::time::sleep(delay).await;
+        delay *= 2;
+
+        if ctx.cancelled.load(Ordering::SeqCst)
+            || generation != ctx.generation.load(Ordering::SeqCst)
+        {
+            return;
+        }
+
+        let Some(client) = ctx.client.upgrade() else {
+            return; // the caller dropped the client
+        };
+
+        ctx.emit(
+            attempt,
+            ctx.resume_attempts,
+            ReconnectPhase::Resume,
+            ReconnectOutcome::Attempting,
+            None,
+        );
+
+        if let Err(err) = client.establish(Some(token.clone())).await {
+            if attempt == ctx.resume_attempts {
+                ctx.set_status(ConnectionStatus::Disconnected);
+                ctx.emit(
+                    attempt,
+                    ctx.resume_attempts,
+                    ReconnectPhase::Resume,
+                    ReconnectOutcome::Failed,
+                    Some(err.to_string()),
+                );
+                return;
+            }
+            warn!("resume attempt {} failed: {}", attempt, err);
+            continue;
+        }
+
+        let resumed = ctx.resume_status.lock().unwrap().as_str() == "resumed";
+        if !resumed {
+            warn!(
+                "reconnected, but the server could not resume the session \
+                 — the agent has no memory of the earlier conversation"
+            );
+        }
+        ctx.emit(
+            attempt,
+            ctx.resume_attempts,
+            ReconnectPhase::Resume,
+            if resumed {
+                ReconnectOutcome::Recovered
+            } else {
+                ReconnectOutcome::RecoveredWithoutHistory
+            },
+            None,
+        );
+        return;
+    }
 }
 
 /// One ICE restart round-trip against the existing peer connection.
@@ -214,10 +369,12 @@ async fn restart_ice(
     })?;
 
     let offer = pc
-        .create_offer(Some(webrtc::peer_connection::offer_answer_options::RTCOfferOptions {
-            ice_restart: true,
-            voice_activity_detection: false,
-        }))
+        .create_offer(Some(
+            webrtc::peer_connection::offer_answer_options::RTCOfferOptions {
+                ice_restart: true,
+                voice_activity_detection: false,
+            },
+        ))
         .await
         .map_err(|e| whip::WhipError::TokenFetch(format!("create restart offer: {e}")))?;
 
@@ -293,6 +450,10 @@ impl Client {
             last_token: Arc::new(Mutex::new(None)),
             etag: Arc::new(Mutex::new(String::new())),
             cancelled: Arc::new(AtomicBool::new(false)),
+            resume_token: Arc::new(Mutex::new(String::new())),
+            resume_status: Arc::new(Mutex::new(String::new())),
+            reconnecting: Arc::new(AtomicBool::new(false)),
+            generation: Arc::new(AtomicU64::new(0)),
             local_track,
             remote_track_notify: Arc::new(Notify::new()),
             remote_track: Arc::new(Mutex::new(None)),
@@ -311,153 +472,218 @@ impl Client {
     }
 
     /// Establish a WebRTC connection to the voice agent server using WHIP.
-    pub async fn connect(&self) -> Result<(), ClientError> {
-        self.set_status(ConnectionStatus::Connecting);
-
-        let mut m = MediaEngine::default();
-        m.register_default_codecs()?;
-
-        let mut registry = Registry::new();
-        registry = register_default_interceptors(registry, &mut m)?;
-
-        let api = APIBuilder::new()
-            .with_media_engine(m)
-            .with_interceptor_registry(registry)
-            .build();
-
-        let ice_servers: Vec<RTCIceServer> = self
-            .config
-            .ice_servers
-            .iter()
-            .map(|url| RTCIceServer {
-                urls: vec![url.clone()],
-                ..Default::default()
-            })
-            .collect();
-
-        let pc = Arc::new(
-            api.new_peer_connection(RTCConfiguration {
-                ice_servers,
-                ..Default::default()
-            })
-            .await?,
-        );
-
-        // Add local audio track.
-        pc.add_track(Arc::clone(&self.local_track) as Arc<dyn TrackLocal + Send + Sync>)
-            .await?;
-
-        // Create data channel for events.
-        let dc = pc.create_data_channel("events", None).await?;
-        self.setup_data_channel(dc);
-
-        // Handle remote track.
-        let remote_track = Arc::clone(&self.remote_track);
-        let notify = Arc::clone(&self.remote_track_notify);
-        pc.on_track(Box::new(move |track, _, _| {
-            let remote_track = Arc::clone(&remote_track);
-            let notify = Arc::clone(&notify);
-            Box::pin(async move {
-                *remote_track.lock().unwrap() = Some(track);
-                notify.notify_one();
-            })
-        }));
-
-        // Handle connection state changes.
+    ///
+    /// Takes `&Arc<Self>` because automatic recovery needs a handle back to
+    /// the client: rebuilding the transport after a failure is not something
+    /// a detached task can do with borrowed state. Callers already holding an
+    /// `Arc<Client>` — which both examples do — call this unchanged.
+    pub async fn connect(self: &Arc<Self>) -> Result<(), ClientError> {
+        // A fresh connect abandons whatever came before, including any resume
+        // token: this is a new conversation, not a continuation.
         self.cancelled.store(false, Ordering::SeqCst);
-        let ctx = ReconnectCtx {
-            pc: Arc::downgrade(&pc),
-            session_url: Arc::clone(&self.session_url),
-            etag: Arc::clone(&self.etag),
-            token: Arc::clone(&self.last_token),
-            fallback_token: self.config.token.clone(),
-            events: Arc::clone(&self.events),
-            state: Arc::clone(&self.state),
-            cancelled: Arc::clone(&self.cancelled),
-            reconnecting: Arc::new(AtomicBool::new(false)),
-            max_attempts: self.config.reconnect_attempts,
-            delay: self.config.reconnect_delay,
-        };
-        pc.on_peer_connection_state_change(Box::new(move |s| {
-            let ctx = ctx.clone();
-            Box::pin(async move {
-                let new_status = match s {
-                    RTCPeerConnectionState::Connected => ConnectionStatus::Connected,
-                    RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
-                        ConnectionStatus::Disconnected
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.resume_token.lock().unwrap().clear();
+        self.establish(None).await
+    }
+
+    /// Build a peer connection and complete WHIP signaling.
+    ///
+    /// With a resume token the server reattaches this new transport to the
+    /// conversation the previous one was having, so the history, the rolling
+    /// summary and the agent's memory of the call all survive. Without one it
+    /// is an ordinary first connect.
+    fn establish(
+        self: &Arc<Self>,
+        resume_token: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send>> {
+        // Boxed rather than a plain `async fn` to break a cycle rustc cannot
+        // reason through: establishing installs the state callback, which
+        // drives recovery, which establishes again. Declaring the future
+        // `Send` here lets each side be checked against the declaration
+        // instead of chasing the cycle forever.
+        let this = Arc::clone(self);
+        Box::pin(async move {
+            this.set_status(if resume_token.is_some() {
+                ConnectionStatus::Reconnecting
+            } else {
+                ConnectionStatus::Connecting
+            });
+
+            let mut m = MediaEngine::default();
+            m.register_default_codecs()?;
+
+            let mut registry = Registry::new();
+            registry = register_default_interceptors(registry, &mut m)?;
+
+            let api = APIBuilder::new()
+                .with_media_engine(m)
+                .with_interceptor_registry(registry)
+                .build();
+
+            let ice_servers: Vec<RTCIceServer> = this
+                .config
+                .ice_servers
+                .iter()
+                .map(|url| RTCIceServer {
+                    urls: vec![url.clone()],
+                    ..Default::default()
+                })
+                .collect();
+
+            let pc = Arc::new(
+                api.new_peer_connection(RTCConfiguration {
+                    ice_servers,
+                    ..Default::default()
+                })
+                .await?,
+            );
+
+            // Add local audio track.
+            pc.add_track(Arc::clone(&this.local_track) as Arc<dyn TrackLocal + Send + Sync>)
+                .await?;
+
+            // Create data channel for events.
+            let dc = pc.create_data_channel("events", None).await?;
+            this.setup_data_channel(dc);
+
+            // Handle remote track.
+            let remote_track = Arc::clone(&this.remote_track);
+            let notify = Arc::clone(&this.remote_track_notify);
+            pc.on_track(Box::new(move |track, _, _| {
+                let remote_track = Arc::clone(&remote_track);
+                let notify = Arc::clone(&notify);
+                Box::pin(async move {
+                    *remote_track.lock().unwrap() = Some(track);
+                    notify.notify_one();
+                })
+            }));
+
+            // Handle connection state changes.
+            let ctx = ReconnectCtx {
+                pc: Arc::downgrade(&pc),
+                client: Arc::downgrade(&this),
+                session_url: Arc::clone(&this.session_url),
+                etag: Arc::clone(&this.etag),
+                resume_token: Arc::clone(&this.resume_token),
+                resume_status: Arc::clone(&this.resume_status),
+                token: Arc::clone(&this.last_token),
+                fallback_token: this.config.token.clone(),
+                events: Arc::clone(&this.events),
+                state: Arc::clone(&this.state),
+                cancelled: Arc::clone(&this.cancelled),
+                reconnecting: Arc::clone(&this.reconnecting),
+                generation: Arc::clone(&this.generation),
+                max_attempts: this.config.reconnect_attempts,
+                delay: this.config.reconnect_delay,
+                resume_attempts: this.config.resume_attempts,
+                resume_delay: this.config.resume_delay,
+            };
+            pc.on_peer_connection_state_change(Box::new(move |s| {
+                let ctx = ctx.clone();
+                Box::pin(async move {
+                    let new_status = match s {
+                        RTCPeerConnectionState::Connected => ConnectionStatus::Connected,
+                        RTCPeerConnectionState::Closed => ConnectionStatus::Disconnected,
+                        RTCPeerConnectionState::Failed => {
+                            // Straight to failed, or the restart phase ran out of
+                            // time. ICE restart is off the table; only a resume
+                            // redial can save the conversation now.
+                            tokio::spawn(run_reconnect(ctx));
+                            return;
+                        }
+                        RTCPeerConnectionState::Disconnected => {
+                            // Transient. ICE often repairs this unaided, so the
+                            // restart sequence waits before spending an attempt —
+                            // but if the local address changed it never will, and
+                            // this is the only window in which a restart can still
+                            // work: at ~25s the server sees Failed, closes the
+                            // peer, and the session becomes unrecoverable.
+                            tokio::spawn(run_reconnect(ctx));
+                            return;
+                        }
+                        _ => return,
+                    };
+                    ctx.set_status(new_status);
+                })
+            }));
+
+            // Create offer.
+            let offer = pc.create_offer(None).await?;
+            pc.set_local_description(offer).await?;
+
+            // Wait for ICE gathering to complete.
+            let gather_done = Arc::new(Notify::new());
+            let gather_notify = Arc::clone(&gather_done);
+            pc.on_ice_gathering_state_change(Box::new(move |state| {
+                let gather_notify = Arc::clone(&gather_notify);
+                Box::pin(async move {
+                    if state
+                        == webrtc::ice_transport::ice_gatherer_state::RTCIceGathererState::Complete
+                    {
+                        gather_notify.notify_one();
                     }
-                    RTCPeerConnectionState::Disconnected => {
-                        // Transient. ICE often repairs this unaided, so the
-                        // restart sequence waits before spending an attempt —
-                        // but if the local address changed it never will, and
-                        // this is the only window in which a restart can still
-                        // work: at ~25s the server sees Failed, closes the
-                        // peer, and the session becomes unrecoverable.
-                        tokio::spawn(run_reconnect(ctx));
-                        return;
-                    }
-                    _ => return,
-                };
-                ctx.set_status(new_status);
-            })
-        }));
+                })
+            }));
+            gather_done.notified().await;
 
-        // Create offer.
-        let offer = pc.create_offer(None).await?;
-        pc.set_local_description(offer).await?;
+            let local_desc = pc.local_description().await.ok_or_else(|| {
+                webrtc::Error::new(
+                    "local description not available after ICE gathering".to_string(),
+                )
+            })?;
 
-        // Wait for ICE gathering to complete.
-        let gather_done = Arc::new(Notify::new());
-        let gather_notify = Arc::clone(&gather_done);
-        pc.on_ice_gathering_state_change(Box::new(move |state| {
-            let gather_notify = Arc::clone(&gather_notify);
-            Box::pin(async move {
-                if state == webrtc::ice_transport::ice_gatherer_state::RTCIceGathererState::Complete
-                {
-                    gather_notify.notify_one();
-                }
-            })
-        }));
-        gather_done.notified().await;
+            // Fetch a fresh token from the token endpoint if configured.
+            let token = if let Some(url) = &this.config.token_url {
+                Some(whip::fetch_token(url, this.config.api_key.as_deref()).await?)
+            } else {
+                this.config.token.clone()
+            };
 
-        let local_desc = pc.local_description().await.ok_or_else(|| {
-            webrtc::Error::new("local description not available after ICE gathering".to_string())
-        })?;
+            // Cache the token so `disconnect` can authenticate the WHIP DELETE.
+            *this.last_token.lock().unwrap() = token.clone();
 
-        // Fetch a fresh token from the token endpoint if configured.
-        let token = if let Some(url) = &self.config.token_url {
-            Some(whip::fetch_token(url, self.config.api_key.as_deref()).await?)
-        } else {
-            self.config.token.clone()
-        };
+            // WHIP exchange.
+            let result = whip::whip_offer(
+                &this.config.whip_endpoint,
+                &local_desc.sdp,
+                token.as_deref(),
+                resume_token.as_deref(),
+            )
+            .await?;
+            *this.session_url.lock().unwrap() = result.session_url;
+            *this.etag.lock().unwrap() = result.etag;
+            *this.resume_token.lock().unwrap() = result.resume_token;
+            *this.resume_status.lock().unwrap() = result.resume_status;
 
-        // Cache the token so `disconnect` can authenticate the WHIP DELETE.
-        *self.last_token.lock().unwrap() = token.clone();
+            let answer = RTCSessionDescription::answer(result.answer_sdp)?;
+            pc.set_remote_description(answer).await?;
 
-        // WHIP exchange.
-        let result = whip::whip_offer(
-            &self.config.whip_endpoint,
-            &local_desc.sdp,
-            token.as_deref(),
-        )
-        .await?;
-        *self.session_url.lock().unwrap() = result.session_url;
-        *self.etag.lock().unwrap() = result.etag;
+            *this.pc.lock().unwrap() = Some(pc);
 
-        let answer = RTCSessionDescription::answer(result.answer_sdp)?;
-        pc.set_remote_description(answer).await?;
+            Ok(())
+        })
+    }
 
-        *self.pc.lock().unwrap() = Some(pc);
-
-        Ok(())
+    /// Close the current peer connection without touching session state, so a
+    /// redial can still use the session URL and resume token.
+    async fn close_peer_connection(&self) {
+        let pc = self.pc.lock().unwrap().take();
+        if let Some(pc) = pc {
+            // The state callback checks the live peer connection and so
+            // ignores this teardown.
+            let _ = pc.close().await;
+        }
     }
 
     /// Tear down the WebRTC connection and free resources.
     pub async fn disconnect(&self) {
-        // Abandons any in-flight ICE restart: it would otherwise PATCH a
-        // session this call is about to DELETE.
+        // Abandons any in-flight recovery: it would otherwise resume a session
+        // this call is about to DELETE.
         self.cancelled.store(true, Ordering::SeqCst);
+        self.generation.fetch_add(1, Ordering::SeqCst);
         self.etag.lock().unwrap().clear();
+        self.resume_token.lock().unwrap().clear();
+        self.resume_status.lock().unwrap().clear();
 
         let session_url = {
             let mut url = self.session_url.lock().unwrap();

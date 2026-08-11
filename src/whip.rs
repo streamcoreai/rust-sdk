@@ -10,6 +10,13 @@ pub struct WhipResult {
     pub session_url: String,
     /// ETag identifying the ICE session (RFC 9725 §4.3.1); required to PATCH it.
     pub etag: String,
+    /// Single-use credential for reattaching a later redial to this
+    /// conversation. Empty when the server cannot resume — a realtime
+    /// (speech-to-speech) session, whose history lives inside the provider.
+    pub resume_token: String,
+    /// "new", "resumed", or "expired". Anything but "resumed" on a redial
+    /// means the agent has no memory of the earlier conversation.
+    pub resume_status: String,
 }
 
 /// The server's reply to an ICE restart.
@@ -45,9 +52,7 @@ impl WhipError {
     /// redial recovers from those.
     pub fn restart_retryable(&self) -> bool {
         match self {
-            WhipError::RestartRejected { status, .. } => {
-                !matches!(status, 404 | 409 | 405)
-            }
+            WhipError::RestartRejected { status, .. } => !matches!(status, 404 | 409 | 405),
             _ => true,
         }
     }
@@ -55,15 +60,27 @@ impl WhipError {
 
 /// Perform a WHIP signaling exchange per RFC 9725 §4.2:
 /// POST an SDP offer, receive a 201 Created with SDP answer and Location header.
+///
+/// `resume_token` is a StreamCore extension: it asks the server to reattach
+/// this new transport to the conversation a previous connection was having,
+/// rather than starting a fresh one. Check `resume_status` on the result — a
+/// token the server no longer recognises still yields a working call, but one
+/// whose agent remembers nothing.
 pub async fn whip_offer(
     endpoint: &str,
     offer_sdp: &str,
     token: Option<&str>,
+    resume_token: Option<&str>,
 ) -> Result<WhipResult, WhipError> {
     let client = Client::new();
     let mut req = client
         .post(endpoint)
         .header("Content-Type", "application/sdp");
+    if let Some(rt) = resume_token {
+        if !rt.is_empty() {
+            req = req.query(&[("resume", rt)]);
+        }
+    }
     if let Some(t) = token {
         req = req.header("Authorization", format!("Bearer {}", t));
     }
@@ -96,12 +113,16 @@ pub async fn whip_offer(
         location
     };
 
-    let etag = resp
-        .headers()
-        .get("etag")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let header = |name: &str| -> String {
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    };
+    let etag = header("etag");
+    let resume_token = header("x-resume-token");
+    let resume_status = header("x-resume-status");
 
     let answer_sdp = resp.text().await?;
 
@@ -109,6 +130,8 @@ pub async fn whip_offer(
         answer_sdp,
         session_url,
         etag,
+        resume_token,
+        resume_status,
     })
 }
 

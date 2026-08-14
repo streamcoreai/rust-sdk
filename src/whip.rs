@@ -4,6 +4,10 @@ use thiserror::Error;
 
 use crate::icerestart::ICE_FRAGMENT_CONTENT_TYPE;
 
+/// Carries the caller identity when there is no token endpoint to sign one into
+/// a claim. For server-side clients, not browsers.
+pub const RESOURCE_ID_HEADER: &str = "X-StreamCore-Resource-Id";
+
 #[derive(Debug)]
 pub struct WhipResult {
     pub answer_sdp: String,
@@ -66,11 +70,15 @@ impl WhipError {
 /// rather than starting a fresh one. Check `resume_status` on the result — a
 /// token the server no longer recognises still yields a working call, but one
 /// whose agent remembers nothing.
+///
+/// `resource_id` goes in a header, not a query parameter, and the server
+/// ignores it whenever the token already carries a claim.
 pub async fn whip_offer(
     endpoint: &str,
     offer_sdp: &str,
     token: Option<&str>,
     resume_token: Option<&str>,
+    resource_id: Option<&str>,
 ) -> Result<WhipResult, WhipError> {
     let client = Client::new();
     let mut req = client
@@ -83,6 +91,9 @@ pub async fn whip_offer(
     }
     if let Some(t) = token {
         req = req.header("Authorization", format!("Bearer {}", t));
+    }
+    if let Some(id) = resource_id.filter(|id| !id.is_empty()) {
+        req = req.header(RESOURCE_ID_HEADER, id);
     }
     let resp = req.body(offer_sdp.to_string()).send().await?;
 
@@ -189,7 +200,14 @@ pub async fn whip_restart_ice(
 
 /// Fetch a JWT from a token endpoint.
 /// If `api_key` is provided, it is sent as a Bearer Authorization header.
-pub async fn fetch_token(token_url: &str, api_key: Option<&str>) -> Result<String, WhipError> {
+///
+/// A non-empty `resource_id` goes in the body for the server to sign into the
+/// token. This call carries the API key, which is why it is trusted to say so.
+pub async fn fetch_token(
+    token_url: &str,
+    api_key: Option<&str>,
+    resource_id: Option<&str>,
+) -> Result<String, WhipError> {
     #[derive(Deserialize)]
     struct TokenResponse {
         token: String,
@@ -198,6 +216,9 @@ pub async fn fetch_token(token_url: &str, api_key: Option<&str>) -> Result<Strin
     let mut req = Client::new().post(token_url);
     if let Some(key) = api_key {
         req = req.header("Authorization", format!("Bearer {}", key));
+    }
+    if let Some(id) = resource_id.filter(|id| !id.is_empty()) {
+        req = req.json(&serde_json::json!({ "resource_id": id }));
     }
 
     let resp = req.send().await?;

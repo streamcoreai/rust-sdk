@@ -145,6 +145,15 @@ pub struct Config {
     /// API key sent as Bearer header when fetching from `token_url`.
     pub api_key: Option<String>,
 
+    /// Who is on the call: an app user ID, or the number a phone call came
+    /// from. The server passes it to an external agent, which can then remember
+    /// a caller across separate calls.
+    ///
+    /// With `token_url` set it goes in the token request body and the server
+    /// signs it into the token. Otherwise it goes as a header, which the server
+    /// only trusts when there is no signed claim.
+    pub resource_id: Option<String>,
+
     /// ICE server URLs for the WebRTC connection.
     /// Defaults to `["stun:stun.l.google.com:19302"]`.
     pub ice_servers: Vec<String>,
@@ -189,6 +198,7 @@ impl Default for Config {
             token: None,
             token_url: None,
             api_key: None,
+            resource_id: None,
             ice_servers: vec!["stun:stun.l.google.com:19302".into()],
             reconnect_attempts: 3,
             reconnect_delay: std::time::Duration::from_secs(2),

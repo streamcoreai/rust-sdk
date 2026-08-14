@@ -632,9 +632,17 @@ impl Client {
                 )
             })?;
 
-            // Fetch a fresh token from the token endpoint if configured.
+            // Fetch a fresh token from the token endpoint if configured. Any
+            // resource_id goes in the body for the server to sign into it.
             let token = if let Some(url) = &this.config.token_url {
-                Some(whip::fetch_token(url, this.config.api_key.as_deref()).await?)
+                Some(
+                    whip::fetch_token(
+                        url,
+                        this.config.api_key.as_deref(),
+                        this.config.resource_id.as_deref(),
+                    )
+                    .await?,
+                )
             } else {
                 this.config.token.clone()
             };
@@ -648,6 +656,7 @@ impl Client {
                 &local_desc.sdp,
                 token.as_deref(),
                 resume_token.as_deref(),
+                this.config.resource_id.as_deref(),
             )
             .await?;
             *this.session_url.lock().unwrap() = result.session_url;
@@ -700,7 +709,9 @@ impl Client {
         }
         if token.is_none() {
             if let Some(url) = &self.config.token_url {
-                if let Ok(t) = whip::fetch_token(url, self.config.api_key.as_deref()).await {
+                if let Ok(t) =
+                    whip::fetch_token(url, self.config.api_key.as_deref(), None).await
+                {
                     token = Some(t);
                 }
             }

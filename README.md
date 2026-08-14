@@ -98,6 +98,7 @@ Creates a new client instance.
 | `token`         | `Option<String>`  | `None`                               | JWT sent as `Authorization: Bearer` on the WHIP request |
 | `token_url`     | `Option<String>`  | `None`                               | Token endpoint; when set, a JWT is fetched before each connection (overrides `token`) |
 | `api_key`       | `Option<String>`  | `None`                               | Sent as `Authorization: Bearer` when fetching from `token_url` |
+| `resource_id`   | `Option<String>`  | `None`                               | Who is on the call, forwarded to an external agent so it can scope memory to the person rather than the call. Sent in the token request body when `token_url` is set (the server signs it into the token), otherwise as an `X-StreamCore-Resource-Id` header |
 | `ice_servers`   | `Vec<String>`     | `["stun:stun.l.google.com:19302"]` | ICE server URLs             |
 | `reconnect_attempts` | `u32`        | `3`                                  | ICE restarts while `Disconnected`; `0` disables the phase |
 | `reconnect_delay` | `Duration`      | `2s`                                 | Wait before the first ICE restart, doubling each retry |

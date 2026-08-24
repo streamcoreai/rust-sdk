@@ -48,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("[error] {}", err);
             })),
             on_data_channel_message: None,
+            on_data: None,
         },
     ));
 
@@ -110,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
 | `on_timing`              | `Option<Box<dyn Fn(TimingEvent) + Send + Sync>>`          | 携带服务端流水线耗时信息 |
 | `on_error`             | `Option<Box<dyn Fn(String) + Send + Sync>>`               | 连接/服务端错误时触发    |
 | `on_data_channel_message`| `Option<Box<dyn Fn(DataChannelMessage) + Send + Sync>>`  | 每条原始 DataChannel 消息都会触发       |
+| `on_data`                | `Option<Box<dyn Fn(&str, &[u8]) + Send + Sync>>`          | 服务端下发的单向数据包，payload 已完成 base64 解码（`movement.command` 承载移动指令） |
 
 ### 客户端方法
 

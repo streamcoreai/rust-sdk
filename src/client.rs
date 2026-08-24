@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use tokio::sync::Notify;
 use tracing::{error, info, warn};
 use webrtc::api::interceptor_registry::register_default_interceptors;
@@ -836,6 +838,14 @@ fn handle_dc_message(
             if let Some(ref cb) = events.on_agent_state_change {
                 if let Some(state) = AgentState::from_str(&msg.state) {
                     cb(state);
+                }
+            }
+        }
+        "data" => {
+            if let Some(ref cb) = events.on_data {
+                match BASE64.decode(&msg.payload) {
+                    Ok(payload) => cb(&msg.topic, &payload),
+                    Err(e) => warn!("bad base64 on topic {}: {}", msg.topic, e),
                 }
             }
         }

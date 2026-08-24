@@ -126,6 +126,12 @@ pub struct DataChannelMessage {
     pub ms: i64,
     #[serde(default)]
     pub state: String,
+    /// Topic of a `data` packet.
+    #[serde(default)]
+    pub topic: String,
+    /// Base64-encoded JSON body of a `data` packet.
+    #[serde(default)]
+    pub payload: String,
 }
 
 /// Configuration for a [`Client`](crate::Client).
@@ -230,6 +236,13 @@ pub struct EventHandler {
     /// Called for every raw data channel message.
     pub on_data_channel_message: Option<Box<dyn Fn(DataChannelMessage) + Send + Sync>>,
 
+    /// Called for a topic-addressed packet from a device-side tool, with the
+    /// payload already base64-decoded. The server sends these fire-and-forget
+    /// — it has already told the model the action succeeded — so there is
+    /// nothing to reply to. Locomotion commands from the `movement.*` tools arrive
+    /// on the `movement.command` topic.
+    pub on_data: Option<Box<dyn Fn(&str, &[u8]) + Send + Sync>>,
+
     /// Called for each ICE restart attempt and once when the outcome is known,
     /// so a UI can distinguish a recoverable drop from a lost call.
     pub on_reconnect: Option<Box<dyn Fn(ReconnectEvent) + Send + Sync>>,
@@ -244,6 +257,7 @@ impl Default for EventHandler {
             on_timing: None,
             on_agent_state_change: None,
             on_data_channel_message: None,
+            on_data: None,
             on_reconnect: None,
         }
     }

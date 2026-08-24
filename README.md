@@ -48,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("[error] {}", err);
             })),
             on_data_channel_message: None,
+            on_data: None,
         },
     ));
 
@@ -119,6 +120,7 @@ Every callback is optional. `EventHandler` implements `Default`, so use `..Defau
 | `on_timing`              | `Option<Box<dyn Fn(TimingEvent) + Send + Sync>>`          | Fired with server-side pipeline timing info |
 | `on_error`             | `Option<Box<dyn Fn(String) + Send + Sync>>`               | Fired on connection/server errors    |
 | `on_data_channel_message`| `Option<Box<dyn Fn(DataChannelMessage) + Send + Sync>>`  | Fired for every raw DC message       |
+| `on_data`                | `Option<Box<dyn Fn(&str, &[u8]) + Send + Sync>>`          | Fire-and-forget server data packet, payload already base64-decoded (`movement.command` carries locomotion commands) |
 
 ### Client Methods
 
